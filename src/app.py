@@ -5,10 +5,14 @@ A super simple FastAPI application that allows students to view and sign up
 for extracurricular activities at Mergington High School.
 """
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Header
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import RedirectResponse
+from pydantic import BaseModel
+from typing import Optional
 import os
+import json
+import secrets
 from pathlib import Path
 
 app = FastAPI(title="Mergington High School API",
@@ -18,6 +22,46 @@ app = FastAPI(title="Mergington High School API",
 current_dir = Path(__file__).parent
 app.mount("/static", StaticFiles(directory=os.path.join(Path(__file__).parent,
           "static")), name="static")
+
+teachers_file = current_dir / "teachers.json"
+active_teacher_sessions = {}
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+def load_teacher_credentials():
+    if not teachers_file.exists():
+        return {}
+
+    with teachers_file.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+
+    return data.get("teachers", {})
+
+
+def extract_bearer_token(authorization: Optional[str]):
+    if not authorization:
+        return None
+
+    parts = authorization.strip().split(" ", 1)
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        return None
+
+    return parts[1]
+
+
+def require_teacher_session(authorization: Optional[str]):
+    token = extract_bearer_token(authorization)
+    if not token or token not in active_teacher_sessions:
+        raise HTTPException(
+            status_code=403,
+            detail="Teacher login required for this action"
+        )
+
+    return active_teacher_sessions[token]
 
 # In-memory activity database
 activities = {
@@ -88,9 +132,53 @@ def get_activities():
     return activities
 
 
+@app.post("/auth/login")
+def teacher_login(payload: LoginRequest):
+    teachers = load_teacher_credentials()
+    valid_password = teachers.get(payload.username)
+
+    if valid_password != payload.password:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    token = secrets.token_urlsafe(24)
+    active_teacher_sessions[token] = payload.username
+    return {
+        "message": f"Logged in as {payload.username}",
+        "token": token,
+        "username": payload.username
+    }
+
+
+@app.get("/auth/me")
+def get_current_teacher(authorization: Optional[str] = Header(default=None)):
+    token = extract_bearer_token(authorization)
+    if token and token in active_teacher_sessions:
+        return {
+            "authenticated": True,
+            "username": active_teacher_sessions[token]
+        }
+
+    return {"authenticated": False}
+
+
+@app.post("/auth/logout")
+def teacher_logout(authorization: Optional[str] = Header(default=None)):
+    token = extract_bearer_token(authorization)
+    if token and token in active_teacher_sessions:
+        active_teacher_sessions.pop(token, None)
+
+    return {"message": "Logged out"}
+
+
 @app.post("/activities/{activity_name}/signup")
-def signup_for_activity(activity_name: str, email: str):
+def signup_for_activity(
+    activity_name: str,
+    email: str,
+    authorization: Optional[str] = Header(default=None)
+):
     """Sign up a student for an activity"""
+    require_teacher_session(authorization)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
@@ -111,8 +199,14 @@ def signup_for_activity(activity_name: str, email: str):
 
 
 @app.delete("/activities/{activity_name}/unregister")
-def unregister_from_activity(activity_name: str, email: str):
+def unregister_from_activity(
+    activity_name: str,
+    email: str,
+    authorization: Optional[str] = Header(default=None)
+):
     """Unregister a student from an activity"""
+    require_teacher_session(authorization)
+
     # Validate activity exists
     if activity_name not in activities:
         raise HTTPException(status_code=404, detail="Activity not found")
